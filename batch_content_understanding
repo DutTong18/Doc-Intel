@@ -1,0 +1,206 @@
+te as #!/usr/bin/env python3
+"""
+Batch-process a folder of PDFs through Azure AI Content Understanding.
+
+For each .pdf in the input folder, submits the file to the Content Understanding
+analyzeBinary endpoint, polls the long-running operation until it completes, and
+writes the resulting JSON payload to the output folder as <pdf-stem>.json.
+
+Auth and endpoint are read from environment variables by default:
+    CONTENTUNDERSTANDING_ENDPOINT   e.g. https://myresource.cognitiveservices.azure.com
+    CONTENTUNDERSTANDING_KEY        the resource access key
+
+Usage:
+    python batch_content_understanding.py <input_folder> <output_folder> \
+        [--analyzer-id prebuilt-documentAnalyzer] \
+        [--api-version 2025-11-01] \
+        [--recursive] [--overwrite] [--workers 4]
+"""
+
+from __future__ import annotations
+
+import argparse
+import concurrent.futures as cf
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+import requests
+
+# Configuration constants
+DEFAULT_ANALYZER_ID = "prebuilt-documentAnalyzer"
+DEFAULT_API_VERSION = "2025-11-01"
+POLL_INTERVAL_SECONDS = 2.0
+POLL_TIMEOUT_SECONDS = 600.0   # per-file polling ceiling
+REQUEST_TIMEOUT_SECONDS = 60.0
+
+
+def submit_pdf(
+    endpoint: str,
+    key: str,
+    analyzer_id: str,
+    api_version: str,
+    pdf_path: Path,
+) -> str:
+    """POST the PDF bytes and return the Operation-Location URL to poll."""
+    url = (
+        f"{endpoint.rstrip('/')}/contentunderstanding/analyzers/"
+        f"{analyzer_id}:analyzeBinary?api-version={api_version}"
+    )
+    headers = {
+        "Ocp-Apim-Subscription-Key": key,
+        "Content-Type": "application/pdf",
+    }
+    with pdf_path.open("rb") as f:
+        resp = requests.post(
+            url, headers=headers, data=f, timeout=REQUEST_TIMEOUT_SECONDS
+        )
+    if resp.status_code not in (200, 202):
+        raise RuntimeError(
+            f"Submit failed ({pdf_path.name}): "
+            f"HTTP {resp.status_code} -- {resp.text[:500]}"
+        )
+    op_loc = resp.headers.get("Operation-Location") or resp.headers.get("operation-location")
+    if not op_loc:
+        raise RuntimeError(
+            f"No Operation-Location header for {pdf_path.name}. "
+            f"Response body: {resp.text[:500]}"
+        )
+    return op_loc
+
+
+def poll_result(key: str, operation_url: str) -> dict[str, Any]:
+    """Poll until the operation reaches a terminal state; return the result payload."""
+    headers = {"Ocp-Apim-Subscription-Key": key}
+    deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
+    while True:
+        resp = requests.get(operation_url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Poll failed: HTTP {resp.status_code} -- {resp.text[:500]}")
+        payload = resp.json()
+        status = (payload.get("status") or "").lower()
+        if status == "succeeded":
+            return payload
+        if status == "failed":
+            raise RuntimeError(f"Analyze failed: {json.dumps(payload)[:500]}")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Polling timed out after {POLL_TIMEOUT_SECONDS}s (last status: {status})"
+            )
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+
+def process_pdf(
+    pdf_path: Path,
+    output_dir: Path,
+    endpoint: str,
+    key: str,
+    analyzer_id: str,
+    api_version: str,
+    overwrite: bool,
+) -> tuple[Path, str]:
+    """Process a single PDF; returns (output_path, status_string)."""
+    out_path = output_dir / (pdf_path.stem + ".json")
+    if out_path.exists() and not overwrite:
+        return out_path, "skipped (exists)"
+    try:
+        op_url = submit_pdf(endpoint, key, analyzer_id, api_version, pdf_path)
+        result = poll_result(key, op_url)
+    except Exception as exc:  # noqa: BLE001
+        return out_path, f"error: {exc}"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(
+        json.dumps(result, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+    return out_path, "ok"
+
+
+def find_pdfs(input_dir: Path, recursive: bool) -> list[Path]:
+    pattern = "**/*.pdf" if recursive else "*.pdf"
+    return sorted(p for p in input_dir.glob(pattern) if p.is_file())
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("input_folder", type=Path, help="Folder containing PDF files")
+    p.add_argument("output_folder", type=Path, help="Folder to write JSON outputs into")
+    p.add_argument(
+        "--analyzer-id", default=DEFAULT_ANALYZER_ID,
+        help=f"Analyzer ID (default: {DEFAULT_ANALYZER_ID})",
+    )
+    p.add_argument(
+        "--api-version", default=DEFAULT_API_VERSION,
+        help=f"API version (default: {DEFAULT_API_VERSION})",
+    )
+    p.add_argument(
+        "--endpoint", default=os.environ.get("CONTENTUNDERSTANDING_ENDPOINT"),
+        help="Resource endpoint (or set CONTENTUNDERSTANDING_ENDPOINT)",
+    )
+    p.add_argument(
+        "--key", default=os.environ.get("CONTENTUNDERSTANDING_KEY"),
+        help="Resource key (or set CONTENTUNDERSTANDING_KEY)",
+    )
+    p.add_argument("--recursive", action="store_true", help="Recurse into subfolders")
+    p.add_argument("--overwrite", action="store_true", help="Reprocess even if output exists")
+    p.add_argument("--workers", type=int, default=4, help="Parallel workers (default: 4)")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if not args.endpoint or not args.key:
+        print(
+            "ERROR: endpoint and key are required. "
+            "Set CONTENTUNDERSTANDING_ENDPOINT and CONTENTUNDERSTANDING_KEY, "
+            "or pass --endpoint/--key.",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.input_folder.is_dir():
+        print(f"ERROR: input folder not found: {args.input_folder}", file=sys.stderr)
+        return 2
+    args.output_folder.mkdir(parents=True, exist_ok=True)
+
+    pdfs = find_pdfs(args.input_folder, args.recursive)
+    if not pdfs:
+        scope = " (recursive)" if args.recursive else ""
+        print(f"No PDFs found in {args.input_folder}{scope}")
+        return 0
+
+    print(
+        f"Processing {len(pdfs)} PDF(s) with analyzer '{args.analyzer_id}' "
+        f"using {args.workers} worker(s)..."
+    )
+
+    ok = skipped = failed = 0
+    with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+        futures = {
+            pool.submit(
+                process_pdf, pdf, args.output_folder, args.endpoint, args.key,
+                args.analyzer_id, args.api_version, args.overwrite,
+            ): pdf
+            for pdf in pdfs
+        }
+        for fut in cf.as_completed(futures):
+            pdf = futures[fut]
+            out_path, status = fut.result()
+            if status == "ok":
+                ok += 1
+            elif status.startswith("skipped"):
+                skipped += 1
+            else:
+                failed += 1
+            print(f"  [{status}] {pdf.name} -> {out_path.name}")
+
+    print(f"\nDone. ok={ok}, skipped={skipped}, failed={failed}")
+    return 0 if failed == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
