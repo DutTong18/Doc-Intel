@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""
+Compare Azure Content Understanding JSON outputs against the original PDFs and
+flag any text that appears in the PDF but is missing from the JSON.
+
+For each (pdf, json) pair (matched by filename stem), the script:
+  1. Extracts text per page from the PDF using pdfplumber.
+  2. Extracts text from the JSON, preferring per-page word arrays
+     (result.contents[].pages[].words[].content) when present, and falling back
+     to a flat collection of every text-bearing field otherwise.
+  3. Normalises both sides (lowercase, punctuation stripped, optional minimum
+     word length) and compares them as word multisets.
+  4. Reports any words found on a PDF page but absent (or under-represented) in
+     the JSON, listing the PDF filename, page number, and the missing words.
+
+The comparison is intentionally lenient because OCR/layout output rarely matches
+direct PDF text extraction byte-for-byte. Treat the output as a triage list of
+pages worth a human eyeball, not as a hard verdict.
+
+Usage:
+    python compare_cu_to_pdf.py <pdf_folder> <json_folder> \
+        [--report report.csv] [--min-word-length 2] [--recursive] \
+        [--max-words-shown 15]
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+import sys
+from collections import Counter
+from pathlib import Path
+from typing import Any
+
+try:
+    import pdfplumber
+except ImportError:
+    print(
+        "ERROR: pdfplumber is required. Install with: pip install pdfplumber",
+        file=sys.stderr,
+    )
+    sys.exit(2)
+
+# Configuration constants
+DEFAULT_MIN_WORD_LENGTH = 2
+DEFAULT_MAX_WORDS_SHOWN = 15
+WORD_SPLIT_RE = re.compile(r"[^\w'-]+", re.UNICODE)
+
+
+def tokenize(text: str, min_length: int) -> list[str]:
+    """Lowercase, split on non-word chars, drop tokens below min_length or all-punct."""
+    if not text:
+        return []
+    tokens = WORD_SPLIT_RE.split(text.lower())
+    return [
+        t.strip("'-")
+        for t in tokens
+        if len(t) >= min_length and any(c.isalnum() for c in t)
+    ]
+
+
+def extract_pdf_pages(pdf_path: Path) -> list[str]:
+    """Return one raw text string per PDF page."""
+    pages: list[str] = []
+    with pdfplumber.open(pdf_path) as pdf:
+        for page in pdf.pages:
+            pages.append(page.extract_text() or "")
+    return pages
+
+
+def extract_cu_per_page(payload: Any) -> dict[int, str]:
+    """Pull per-page text from CU JSON (pages[].words[].content / lines[].content).
+
+    Returns an empty dict when the payload contains no recognisable page nodes,
+    which signals the caller to fall back to the whole-document comparison.
+    """
+    pages: dict[int, list[str]] = {}
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            page_num = node.get("pageNumber")
+            if isinstance(page_num, int) and ("words" in node or "lines" in node):
+                bucket = pages.setdefault(page_num, [])
+                words = node.get("words") or []
+                if words:
+                    for w in words:
+                        if isinstance(w, dict) and isinstance(w.get("content"), str):
+                            bucket.append(w["content"])
+                else:
+                    for ln in node.get("lines") or []:
+                        if isinstance(ln, dict) and isinstance(ln.get("content"), str):
+                            bucket.append(ln["content"])
+                # A page node is a leaf for our purposes; don't recurse into it
+                return
+            for v in node.values():
+                visit(v)
+        elif isinstance(node, list):
+            for v in node:
+                visit(v)
+
+    visit(payload)
+    return {pn: " ".join(parts) for pn, parts in pages.items()}
+
+
+def extract_cu_all_text(payload: Any) -> str:
+    """Collect every text-bearing field from anywhere in the JSON as fallback."""
+    parts: list[str] = []
+    text_keys = ("markdown", "content", "valueString", "text")
+
+    def visit(node: Any) -> None:
+        if isinstance(node, dict):
+            for key in text_keys:
+                v = node.get(key)
+                if isinstance(v, str):
+                    parts.append(v)
+            for v in node.values():
+                visit(v)
+        elif isinstance(node, list):
+            for v in node:
+                visit(v)
+
+    visit(payload)
+    return "\n".join(parts)
+
+
+def find_missing_per_page(
+    pdf_pages: list[str],
+    cu_per_page: dict[int, str],
+    cu_all_text: str,
+    min_length: int,
+) -> list[tuple[int, list[str], str]]:
+    """Return [(page_num, missing_words, comparison_mode), ...] for pages with misses."""
+    cu_all_counter = Counter(tokenize(cu_all_text, min_length))
+    use_per_page = bool(cu_per_page)
+    results: list[tuple[int, list[str], str]] = []
+
+    for idx, page_text in enumerate(pdf_pages, start=1):
+        pdf_counter = Counter(tokenize(page_text, min_length))
+        if not pdf_counter:
+            continue
+
+        if use_per_page and idx in cu_per_page:
+            cu_counter = Counter(tokenize(cu_per_page[idx], min_length))
+            mode = "per-page"
+        else:
+            cu_counter = cu_all_counter
+            mode = "whole-doc"
+
+        missing = sorted(
+            {word for word, n in pdf_counter.items() if cu_counter[word] < n}
+        )
+        if missing:
+            results.append((idx, missing, mode))
+    return results
+
+
+def find_pairs(
+    pdf_dir: Path, json_dir: Path, recursive: bool
+) -> list[tuple[Path, Path]]:
+    """Match each PDF to a JSON file with the same stem in json_dir."""
+    pattern = "**/*.pdf" if recursive else "*.pdf"
+    pairs: list[tuple[Path, Path]] = []
+    for pdf in sorted(pdf_dir.glob(pattern)):
+        if not pdf.is_file():
+            continue
+        json_path = json_dir / (pdf.stem + ".json")
+        if json_path.is_file():
+            pairs.append((pdf, json_path))
+        else:
+            print(
+                f"WARN: no JSON found for {pdf.name} (expected {json_path.name})",
+                file=sys.stderr,
+            )
+    return pairs
+
+
+def write_report(rows: list[dict[str, Any]], path: Path) -> None:
+    if path.suffix.lower() == ".json":
+        path.write_text(json.dumps(rows, indent=2, ensure_ascii=False), encoding="utf-8")
+    else:
+        with path.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(
+                f,
+                fieldnames=["pdf_name", "page", "mode", "missing_count", "missing_words"],
+            )
+            writer.writeheader()
+            writer.writerows(rows)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("pdf_folder", type=Path, help="Folder containing the original PDFs")
+    p.add_argument("json_folder", type=Path, help="Folder containing CU JSON outputs")
+    p.add_argument(
+        "--report", type=Path,
+        help="Optional output report path (.csv or .json based on extension)",
+    )
+    p.add_argument(
+        "--min-word-length", type=int, default=DEFAULT_MIN_WORD_LENGTH,
+        help=f"Ignore tokens shorter than this (default: {DEFAULT_MIN_WORD_LENGTH})",
+    )
+    p.add_argument(
+        "--max-words-shown", type=int, default=DEFAULT_MAX_WORDS_SHOWN,
+        help=f"How many missing words to print per page (default: {DEFAULT_MAX_WORDS_SHOWN})",
+    )
+    p.add_argument("--recursive", action="store_true", help="Recurse into PDF subfolders")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if not args.pdf_folder.is_dir():
+        print(f"ERROR: PDF folder not found: {args.pdf_folder}", file=sys.stderr)
+        return 2
+    if not args.json_folder.is_dir():
+        print(f"ERROR: JSON folder not found: {args.json_folder}", file=sys.stderr)
+        return 2
+
+    pairs = find_pairs(args.pdf_folder, args.json_folder, args.recursive)
+    if not pairs:
+        print("No matching PDF/JSON pairs found.")
+        return 0
+
+    rows: list[dict[str, Any]] = []
+    clean_pdfs = 0
+    flagged_pdfs = 0
+
+    for pdf, json_path in pairs:
+        try:
+            pdf_pages = extract_pdf_pages(pdf)
+            payload = json.loads(json_path.read_text(encoding="utf-8"))
+            cu_per_page = extract_cu_per_page(payload)
+            cu_all_text = extract_cu_all_text(payload)
+            misses = find_missing_per_page(
+                pdf_pages, cu_per_page, cu_all_text, args.min_word_length
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[error] {pdf.name}: {exc}", file=sys.stderr)
+            continue
+
+        if not misses:
+            clean_pdfs += 1
+            print(f"[ok] {pdf.name}: no missing words detected ({len(pdf_pages)} page(s))")
+            continue
+
+        flagged_pdfs += 1
+        for page, words, mode in misses:
+            shown = words[: args.max_words_shown]
+            extra = (
+                ""
+                if len(words) <= args.max_words_shown
+                else f" (+{len(words) - args.max_words_shown} more)"
+            )
+            print(
+                f"[miss] {pdf.name} p.{page} ({mode}): "
+                f"{len(words)} word(s) -- {', '.join(shown)}{extra}"
+            )
+            rows.append(
+                {
+                    "pdf_name": pdf.name,
+                    "page": page,
+                    "mode": mode,
+                    "missing_count": len(words),
+                    "missing_words": " ".join(words),
+                }
+            )
+
+    print(
+        f"\nDone. clean={clean_pdfs}, flagged={flagged_pdfs}, "
+        f"total_pairs={len(pairs)}"
+    )
+
+    if args.report and rows:
+        write_report(rows, args.report)
+        print(f"Report written to {args.report}")
+    elif args.report:
+        print("No misses to report; report file not written.")
+
+    return 0 if flagged_pdfs == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
