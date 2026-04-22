@@ -1,20 +1,27 @@
-te as #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
-Batch-process a folder of PDFs through Azure AI Content Understanding.
+Batch-process a folder of PDFs through Azure AI Content Understanding OR
+Azure AI Document Intelligence, saving each result as JSON.
 
-For each .pdf in the input folder, submits the file to the Content Understanding
-analyzeBinary endpoint, polls the long-running operation until it completes, and
-writes the resulting JSON payload to the output folder as <pdf-stem>.json.
+Both services use the same overall pattern (POST binary, get Operation-Location,
+poll until Succeeded/Failed) so the script just dispatches to the right URL
+template depending on which service the user picks.
 
-Auth and endpoint are read from environment variables by default:
-    CONTENTUNDERSTANDING_ENDPOINT   e.g. https://myresource.cognitiveservices.azure.com
-    CONTENTUNDERSTANDING_KEY        the resource access key
+Auth: endpoint and key are pre-set in the SERVICES dict near the top of this
+file. Replace the placeholder values with your own. Environment variables are
+honoured if they are set:
+    CONTENTUNDERSTANDING_ENDPOINT / CONTENTUNDERSTANDING_KEY
+    DOCUMENTINTELLIGENCE_ENDPOINT / DOCUMENTINTELLIGENCE_KEY
+
+NOTE: Hardcoding API keys in source is convenient but risky -- do not commit
+this file to a public repo with real credentials in it. Prefer env vars or a
+secrets manager for anything beyond local one-off use.
 
 Usage:
-    python batch_content_understanding.py <input_folder> <output_folder> \
-        [--analyzer-id prebuilt-documentAnalyzer] \
-        [--api-version 2025-11-01] \
-        [--recursive] [--overwrite] [--workers 4]
+    python batch_content_understanding.py
+    python batch_content_understanding.py --service doc-intelligence
+    python batch_content_understanding.py --input ./pdfs --output ./out \
+        --service content-understanding --recursive
 """
 
 from __future__ import annotations
@@ -31,27 +38,60 @@ from typing import Any
 import requests
 
 # Configuration constants
-DEFAULT_ANALYZER_ID = "prebuilt-documentAnalyzer"
-DEFAULT_API_VERSION = "2025-11-01"
 POLL_INTERVAL_SECONDS = 2.0
 POLL_TIMEOUT_SECONDS = 600.0   # per-file polling ceiling
 REQUEST_TIMEOUT_SECONDS = 60.0
 
+# Pre-set service configurations. Replace the placeholder endpoint/key values
+# with your own. Env vars (listed in env_endpoint / env_key) override these
+# at runtime if set.
+SERVICES: dict[str, dict[str, str]] = {
+    "content-understanding": {
+        "label": "Azure Content Understanding",
+        "endpoint": "https://<your-cu-resource>.cognitiveservices.azure.com",
+        "key": "<your-content-understanding-key>",
+        "env_endpoint": "CONTENTUNDERSTANDING_ENDPOINT",
+        "env_key": "CONTENTUNDERSTANDING_KEY",
+        "api_version": "2025-11-01",
+        "default_analyzer": "prebuilt-documentAnalyzer",
+        "url_template": (
+            "{endpoint}/contentunderstanding/analyzers/"
+            "{analyzer}:analyzeBinary?api-version={api_version}"
+        ),
+    },
+    "doc-intelligence": {
+        "label": "Azure Document Intelligence",
+        "endpoint": "https://<your-di-resource>.cognitiveservices.azure.com",
+        "key": "<your-document-intelligence-key>",
+        "env_endpoint": "DOCUMENTINTELLIGENCE_ENDPOINT",
+        "env_key": "DOCUMENTINTELLIGENCE_KEY",
+        "api_version": "2024-11-30",
+        "default_analyzer": "prebuilt-read",
+        "url_template": (
+            "{endpoint}/documentintelligence/documentModels/"
+            "{analyzer}:analyze?api-version={api_version}"
+        ),
+    },
+}
 
-def submit_pdf(
-    endpoint: str,
-    key: str,
-    analyzer_id: str,
-    api_version: str,
-    pdf_path: Path,
-) -> str:
+
+def resolve_service(service_key: str) -> dict[str, str]:
+    """Return a service config with env-var overrides applied."""
+    cfg = dict(SERVICES[service_key])  # shallow copy so we can override
+    cfg["endpoint"] = os.environ.get(cfg["env_endpoint"]) or cfg["endpoint"]
+    cfg["key"] = os.environ.get(cfg["env_key"]) or cfg["key"]
+    return cfg
+
+
+def submit_pdf(service: dict[str, str], analyzer_id: str, pdf_path: Path) -> str:
     """POST the PDF bytes and return the Operation-Location URL to poll."""
-    url = (
-        f"{endpoint.rstrip('/')}/contentunderstanding/analyzers/"
-        f"{analyzer_id}:analyzeBinary?api-version={api_version}"
+    url = service["url_template"].format(
+        endpoint=service["endpoint"].rstrip("/"),
+        analyzer=analyzer_id,
+        api_version=service["api_version"],
     )
     headers = {
-        "Ocp-Apim-Subscription-Key": key,
+        "Ocp-Apim-Subscription-Key": service["key"],
         "Content-Type": "application/pdf",
     }
     with pdf_path.open("rb") as f:
@@ -72,9 +112,9 @@ def submit_pdf(
     return op_loc
 
 
-def poll_result(key: str, operation_url: str) -> dict[str, Any]:
+def poll_result(service: dict[str, str], operation_url: str) -> dict[str, Any]:
     """Poll until the operation reaches a terminal state; return the result payload."""
-    headers = {"Ocp-Apim-Subscription-Key": key}
+    headers = {"Ocp-Apim-Subscription-Key": service["key"]}
     deadline = time.monotonic() + POLL_TIMEOUT_SECONDS
     while True:
         resp = requests.get(operation_url, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
@@ -96,10 +136,8 @@ def poll_result(key: str, operation_url: str) -> dict[str, Any]:
 def process_pdf(
     pdf_path: Path,
     output_dir: Path,
-    endpoint: str,
-    key: str,
+    service: dict[str, str],
     analyzer_id: str,
-    api_version: str,
     overwrite: bool,
 ) -> tuple[Path, str]:
     """Process a single PDF; returns (output_path, status_string)."""
@@ -107,8 +145,8 @@ def process_pdf(
     if out_path.exists() and not overwrite:
         return out_path, "skipped (exists)"
     try:
-        op_url = submit_pdf(endpoint, key, analyzer_id, api_version, pdf_path)
-        result = poll_result(key, op_url)
+        op_url = submit_pdf(service, analyzer_id, pdf_path)
+        result = poll_result(service, op_url)
     except Exception as exc:  # noqa: BLE001
         return out_path, f"error: {exc}"
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -128,23 +166,29 @@ def parse_args() -> argparse.Namespace:
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("input_folder", type=Path, help="Folder containing PDF files")
-    p.add_argument("output_folder", type=Path, help="Folder to write JSON outputs into")
     p.add_argument(
-        "--analyzer-id", default=DEFAULT_ANALYZER_ID,
-        help=f"Analyzer ID (default: {DEFAULT_ANALYZER_ID})",
+        "--input", "-i", dest="input_folder", type=Path, default=None,
+        help="Folder containing PDF files (prompted if omitted)",
     )
     p.add_argument(
-        "--api-version", default=DEFAULT_API_VERSION,
-        help=f"API version (default: {DEFAULT_API_VERSION})",
+        "--output", "-o", dest="output_folder", type=Path, default=None,
+        help="Folder to write JSON outputs into (prompted if omitted)",
     )
     p.add_argument(
-        "--endpoint", default=os.environ.get("CONTENTUNDERSTANDING_ENDPOINT"),
-        help="Resource endpoint (or set CONTENTUNDERSTANDING_ENDPOINT)",
+        "--service", choices=list(SERVICES.keys()), default=None,
+        help="Which Azure service to use (prompted if omitted)",
     )
     p.add_argument(
-        "--key", default=os.environ.get("CONTENTUNDERSTANDING_KEY"),
-        help="Resource key (or set CONTENTUNDERSTANDING_KEY)",
+        "--analyzer-id", default=None,
+        help="Override the analyzer/model ID for the chosen service",
+    )
+    p.add_argument(
+        "--endpoint", default=None,
+        help="Override the pre-set endpoint for the chosen service",
+    )
+    p.add_argument(
+        "--key", default=None,
+        help="Override the pre-set key for the chosen service",
     )
     p.add_argument("--recursive", action="store_true", help="Recurse into subfolders")
     p.add_argument("--overwrite", action="store_true", help="Reprocess even if output exists")
@@ -152,19 +196,89 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def prompt_for_path(prompt: str, must_exist: bool) -> Path:
+    """Prompt until the user gives a path that satisfies must_exist (or any path if not)."""
+    while True:
+        try:
+            raw = input(prompt).strip()
+        except EOFError:
+            print("\nNo input received; aborting.", file=sys.stderr)
+            sys.exit(2)
+        # Strip surrounding quotes that some shells add when paths are dragged in
+        if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+            raw = raw[1:-1]
+        if not raw:
+            print("  Path cannot be empty.")
+            continue
+        path = Path(raw).expanduser().resolve()
+        if must_exist and not path.is_dir():
+            print(f"  Folder not found: {path}")
+            continue
+        return path
+
+
+def prompt_for_service() -> str:
+    """Show a numbered menu of services and return the selected key."""
+    keys = list(SERVICES.keys())
+    print("\nWhich Azure service would you like to use?")
+    for i, k in enumerate(keys, start=1):
+        print(f"  {i}. {SERVICES[k]['label']}  ({k})")
+    while True:
+        try:
+            raw = input(f"Choose [1-{len(keys)}]: ").strip().lower()
+        except EOFError:
+            print("\nNo input received; aborting.", file=sys.stderr)
+            sys.exit(2)
+        if raw in keys:
+            return raw
+        if raw.isdigit() and 1 <= int(raw) <= len(keys):
+            return keys[int(raw) - 1]
+        print(f"  Invalid choice. Enter 1-{len(keys)} or one of: {', '.join(keys)}")
+
+
+def looks_like_placeholder(value: str) -> bool:
+    return not value or value.startswith("<") or value.endswith(">")
+
+
 def main() -> int:
     args = parse_args()
-    if not args.endpoint or not args.key:
+
+    # Pick the service (prompted if not supplied)
+    service_key = args.service or prompt_for_service()
+    service = resolve_service(service_key)
+
+    # Apply CLI overrides for endpoint/key/analyzer
+    if args.endpoint:
+        service["endpoint"] = args.endpoint
+    if args.key:
+        service["key"] = args.key
+    analyzer_id = args.analyzer_id or service["default_analyzer"]
+
+    # Validate credentials are real, not the shipped placeholders
+    if looks_like_placeholder(service["endpoint"]) or looks_like_placeholder(service["key"]):
         print(
-            "ERROR: endpoint and key are required. "
-            "Set CONTENTUNDERSTANDING_ENDPOINT and CONTENTUNDERSTANDING_KEY, "
-            "or pass --endpoint/--key.",
+            f"ERROR: {service['label']} endpoint/key not configured. "
+            f"Edit SERVICES[{service_key!r}] in this script, or set the "
+            f"{service['env_endpoint']} / {service['env_key']} environment "
+            f"variables, or pass --endpoint/--key.",
             file=sys.stderr,
         )
         return 2
-    if not args.input_folder.is_dir():
-        print(f"ERROR: input folder not found: {args.input_folder}", file=sys.stderr)
-        return 2
+
+    # Prompt for any folder path that wasn't supplied on the command line
+    if args.input_folder is None:
+        args.input_folder = prompt_for_path("Input folder (with PDFs): ", must_exist=True)
+    else:
+        args.input_folder = args.input_folder.expanduser().resolve()
+        if not args.input_folder.is_dir():
+            print(f"ERROR: input folder not found: {args.input_folder}", file=sys.stderr)
+            return 2
+
+    if args.output_folder is None:
+        args.output_folder = prompt_for_path("Output folder (for JSON): ", must_exist=False)
+    else:
+        args.output_folder = args.output_folder.expanduser().resolve()
+
     args.output_folder.mkdir(parents=True, exist_ok=True)
 
     pdfs = find_pdfs(args.input_folder, args.recursive)
@@ -174,16 +288,16 @@ def main() -> int:
         return 0
 
     print(
-        f"Processing {len(pdfs)} PDF(s) with analyzer '{args.analyzer_id}' "
-        f"using {args.workers} worker(s)..."
+        f"\nUsing {service['label']} (analyzer/model '{analyzer_id}', "
+        f"api-version {service['api_version']}).\n"
+        f"Processing {len(pdfs)} PDF(s) with {args.workers} worker(s)..."
     )
 
     ok = skipped = failed = 0
     with cf.ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
         futures = {
             pool.submit(
-                process_pdf, pdf, args.output_folder, args.endpoint, args.key,
-                args.analyzer_id, args.api_version, args.overwrite,
+                process_pdf, pdf, args.output_folder, service, analyzer_id, args.overwrite,
             ): pdf
             for pdf in pdfs
         }
