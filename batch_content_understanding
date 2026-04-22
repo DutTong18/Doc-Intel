@@ -7,9 +7,13 @@ Both services use the same overall pattern (POST binary, get Operation-Location,
 poll until Succeeded/Failed) so the script just dispatches to the right URL
 template depending on which service the user picks.
 
-Auth: endpoint and key are pre-set in the SERVICES dict near the top of this
-file. Replace the placeholder values with your own. Environment variables are
-honoured if they are set:
+Auth: at runtime the script prompts for the endpoint and key for the chosen
+service. If you've filled in real values in the SERVICES dict below, or set the
+matching env vars, those are offered as defaults that you can accept by just
+pressing Enter. The key prompt is masked (input is not echoed). To skip the
+prompts entirely (e.g. for automation), pass --endpoint and --key.
+
+Env vars honoured as prompt defaults:
     CONTENTUNDERSTANDING_ENDPOINT / CONTENTUNDERSTANDING_KEY
     DOCUMENTINTELLIGENCE_ENDPOINT / DOCUMENTINTELLIGENCE_KEY
 
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures as cf
+import getpass
 import json
 import os
 import sys
@@ -236,6 +241,41 @@ def prompt_for_service() -> str:
         print(f"  Invalid choice. Enter 1-{len(keys)} or one of: {', '.join(keys)}")
 
 
+def prompt_credentials(service: dict[str, str]) -> tuple[str, str]:
+    """Prompt for endpoint and key. Pre-set values in `service` are used as defaults."""
+    label = service["label"]
+
+    # Endpoint prompt -- echoed normally
+    default_endpoint = "" if looks_like_placeholder(service["endpoint"]) else service["endpoint"]
+    suffix = f" [{default_endpoint}]" if default_endpoint else ""
+    while True:
+        try:
+            raw = input(f"{label} endpoint{suffix}: ").strip()
+        except EOFError:
+            print("\nNo input received; aborting.", file=sys.stderr)
+            sys.exit(2)
+        endpoint = raw or default_endpoint
+        if endpoint and not looks_like_placeholder(endpoint):
+            break
+        print("  Endpoint cannot be empty.")
+
+    # Key prompt -- masked via getpass so it doesn't appear on screen or in history
+    default_key = "" if looks_like_placeholder(service["key"]) else service["key"]
+    suffix = " [press Enter to use saved value]" if default_key else ""
+    while True:
+        try:
+            raw = getpass.getpass(f"{label} key{suffix}: ").strip()
+        except EOFError:
+            print("\nNo input received; aborting.", file=sys.stderr)
+            sys.exit(2)
+        key = raw or default_key
+        if key and not looks_like_placeholder(key):
+            break
+        print("  Key cannot be empty.")
+
+    return endpoint, key
+
+
 def looks_like_placeholder(value: str) -> bool:
     return not value or value.startswith("<") or value.endswith(">")
 
@@ -254,16 +294,13 @@ def main() -> int:
         service["key"] = args.key
     analyzer_id = args.analyzer_id or service["default_analyzer"]
 
-    # Validate credentials are real, not the shipped placeholders
-    if looks_like_placeholder(service["endpoint"]) or looks_like_placeholder(service["key"]):
-        print(
-            f"ERROR: {service['label']} endpoint/key not configured. "
-            f"Edit SERVICES[{service_key!r}] in this script, or set the "
-            f"{service['env_endpoint']} / {service['env_key']} environment "
-            f"variables, or pass --endpoint/--key.",
-            file=sys.stderr,
-        )
-        return 2
+    # Prompt for any credentials not provided via CLI flags. Pre-set values
+    # (from SERVICES or env vars) are offered as defaults you can accept by
+    # pressing Enter.
+    if not args.endpoint or not args.key:
+        endpoint, key = prompt_credentials(service)
+        service["endpoint"] = endpoint
+        service["key"] = key
 
     # Prompt for any folder path that wasn't supplied on the command line
     if args.input_folder is None:
